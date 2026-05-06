@@ -41,11 +41,25 @@ import {
 import { cn } from './utils';
 import { PainRecord, PainIntensity, TCMAnalysis, MedicalReport } from './types';
 import { translations } from './translations';
-
-// Initialize Gemini
-const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+import { auth, db, signInWithGoogle, logout, handleFirestoreError, OperationType } from './lib/firebase';
+import { onAuthStateChanged, User } from 'firebase/auth';
+import { 
+  collection, 
+  onSnapshot, 
+  query, 
+  addDoc, 
+  deleteDoc, 
+  doc, 
+  setDoc,
+  getDoc,
+  orderBy,
+  Timestamp,
+  serverTimestamp
+} from 'firebase/firestore';
 
 export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [painRecords, setPainRecords] = useState<PainRecord[]>([]);
   const [reports, setReports] = useState<MedicalReport[]>([]);
   const [analysis, setAnalysis] = useState<TCMAnalysis | null>(null);
@@ -59,36 +73,87 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  
   const t = translations[lang];
   
   // Loading messages for better UX
-  const [loadingMessage, setLoadingMessage] = useState(t.loadingData);
+  const [loadingMessage, setLoadingMessage] = useState(translations[lang].loadingData);
   const [newPain, setNewPain] = useState({
-    location: t.locations[0],
+    location: translations[lang].locations[0],
     intensity: PainIntensity.LOW,
     description: ''
   });
+  const [customLocation, setCustomLocation] = useState('');
 
-  // Load data from localStorage on mount
+  // Auth & Sync Logic
   useEffect(() => {
-    const savedRecords = localStorage.getItem('tcm_pain_records');
-    const savedReports = localStorage.getItem('tcm_reports');
-    const savedAnalysis = localStorage.getItem('tcm_analysis');
-    const savedLang = localStorage.getItem('tcm_lang') as 'zh' | 'en';
-    
-    if (savedRecords) setPainRecords(JSON.parse(savedRecords));
-    if (savedReports) setReports(JSON.parse(savedReports));
-    if (savedAnalysis) setAnalysis(JSON.parse(savedAnalysis));
-    if (savedLang) setLang(savedLang);
-  }, []);
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setUser(user);
+      setIsAuthLoading(false);
+      
+      if (user) {
+        // Sync Basic Profile
+        const userRef = doc(db, 'users', user.uid);
+        getDoc(userRef).then(docSnap => {
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            if (data.lang) setLang(data.lang);
+          } else {
+            setDoc(userRef, {
+              uid: user.uid,
+              email: user.email,
+              displayName: user.displayName,
+              lang: lang,
+              createdAt: serverTimestamp()
+            });
+          }
+        });
 
-  // Save data to localStorage when it changes
+        // Sync Pain Records
+        const painRef = collection(db, 'users', user.uid, 'pain_records');
+        const qPain = query(painRef, orderBy('date', 'desc'));
+        const unsubPain = onSnapshot(qPain, (snap) => {
+          const records = snap.docs.map(doc => ({ ...doc.data() } as PainRecord));
+          setPainRecords(records);
+        }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/pain_records`));
+
+        // Sync Medical Reports
+        const reportsRef = collection(db, 'users', user.uid, 'medical_reports');
+        const unsubReports = onSnapshot(reportsRef, (snap) => {
+          const docs = snap.docs.map(doc => ({ ...doc.data() } as MedicalReport));
+          setReports(docs);
+        }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/medical_reports`));
+
+        // Sync Latest Analysis
+        const analysisRef = doc(db, 'users', user.uid, 'analysis', 'latest');
+        const unsubAnalysis = onSnapshot(analysisRef, (snap) => {
+          if (snap.exists()) {
+            setAnalysis(snap.data() as TCMAnalysis);
+          }
+        }, (err) => handleFirestoreError(err, OperationType.GET, `users/${user.uid}/analysis/latest`));
+
+        return () => {
+          unsubPain();
+          unsubReports();
+          unsubAnalysis();
+        };
+      } else {
+        setPainRecords([]);
+        setReports([]);
+        setAnalysis(null);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [lang]);
+
+  // Save language preference to Firestore if user exists
   useEffect(() => {
-    localStorage.setItem('tcm_pain_records', JSON.stringify(painRecords));
-    localStorage.setItem('tcm_reports', JSON.stringify(reports));
-    localStorage.setItem('tcm_lang', lang);
-    if (analysis) localStorage.setItem('tcm_analysis', JSON.stringify(analysis));
-  }, [painRecords, reports, analysis, lang]);
+    if (user) {
+      const userRef = doc(db, 'users', user.uid);
+      setDoc(userRef, { lang }, { merge: true });
+    }
+  }, [lang, user]);
 
   // Track if there is new data to analyze
   useEffect(() => {
@@ -99,26 +164,51 @@ export default function App() {
     }
   }, [painRecords.length, reports.length]);
 
-  const addPainRecord = () => {
+  const addPainRecord = async () => {
+    if (!user) return;
+    const recordId = Date.now().toString();
+    
+    // Use custom location if "Other" is selected
+    const isOther = newPain.location === translations.zh.locations[translations.zh.locations.length - 1] || 
+                   newPain.location === translations.en.locations[translations.en.locations.length - 1];
+    
+    const finalLocation = isOther && customLocation.trim() ? customLocation.trim() : newPain.location;
+
     const record: PainRecord = {
-      id: Date.now().toString(),
+      id: recordId,
       date: new Date().toISOString(),
-      ...newPain
+      location: finalLocation,
+      intensity: newPain.intensity,
+      description: newPain.description
     };
-    setPainRecords([record, ...painRecords]);
-    setNewPain({ location: t.locations[0], intensity: PainIntensity.LOW, description: '' });
-    setShowPainForm(false);
+    
+    try {
+      await setDoc(doc(db, 'users', user.uid, 'pain_records', recordId), {
+        ...record,
+        userId: user.uid
+      });
+      setNewPain({ location: t.locations[0], intensity: PainIntensity.LOW, description: '' });
+      setCustomLocation('');
+      setShowPainForm(false);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `users/${user.uid}/pain_records`);
+    }
   };
 
-  const deleteRecord = (id: string) => {
-    setPainRecords(painRecords.filter(r => r.id !== id));
+  const deleteRecord = async (id: string) => {
+    if (!user) return;
+    try {
+      await deleteDoc(doc(db, 'users', user.uid, 'pain_records', id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}/pain_records/${id}`);
+    }
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!user) return;
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Limit file size to 2MB to prevent LocalStorage issues
     if (file.size > 2 * 1024 * 1024) {
       alert(t.fileTooLarge);
       return;
@@ -132,21 +222,30 @@ export default function App() {
       if (file.type.includes('image')) fileType = 'image';
       else if (file.type.includes('pdf')) fileType = 'pdf';
 
+      const reportId = Date.now().toString();
       const newReport: MedicalReport = {
-        id: Date.now().toString(),
+        id: reportId,
         name: file.name,
         uploadDate: new Date().toISOString(),
         type: fileType,
         content: base64Data
       };
-      setReports([newReport, ...reports]);
+      
+      try {
+        await setDoc(doc(db, 'users', user.uid, 'medical_reports', reportId), {
+          ...newReport,
+          userId: user.uid
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.WRITE, `users/${user.uid}/medical_reports`);
+      }
     };
     reader.readAsDataURL(file);
-    // Reset input
     e.target.value = '';
   };
 
   const runAnalysis = async () => {
+    if (!user) return;
     setIsAnalyzing(true);
     setLoadingMessage(t.loadingData);
     
@@ -186,31 +285,27 @@ export default function App() {
         }
       `;
 
-      const parts: any[] = [{ text: prompt }];
+      const response = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          reports: reports.slice(0, 3).map(r => ({ content: r.content })),
+          lang
+        })
+      });
+
+      if (!response.ok) throw new Error('AI analysis failed');
       
-      // Add reports as image or pdf parts
-      reports.slice(0, 3).forEach(report => {
-        if (report.content && (report.type === 'image' || report.type === 'pdf')) {
-          const [mimeType, data] = report.content.split(';base64,');
-          parts.push({
-            inlineData: {
-              mimeType: mimeType.split(':')[1],
-              data: data
-            }
-          });
-        }
+      const analysisData = await response.json();
+      
+      // Save to Firestore
+      await setDoc(doc(db, 'users', user.uid, 'analysis', 'latest'), {
+        ...analysisData,
+        userId: user.uid,
+        updatedAt: serverTimestamp()
       });
 
-      const result = await genAI.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: [{ role: 'user', parts }],
-        config: { 
-          responseMimeType: "application/json",
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } // Faster response
-        }
-      });
-
-      const analysisData = JSON.parse(result.text || '{}');
       setAnalysis(analysisData);
       setHasNewData(false);
       setActiveTab('analysis');
@@ -229,7 +324,7 @@ export default function App() {
   }, [chatMessages]);
 
   const handleSendMessage = async () => {
-    if (!chatInput.trim() || isChatLoading || !analysis) return;
+    if (!chatInput.trim() || isChatLoading || !analysis || !user) return;
 
     const userMsg = chatInput.trim();
     setChatInput('');
@@ -238,34 +333,41 @@ export default function App() {
     setIsChatLoading(true);
 
     try {
-      const chat = genAI.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: [
-          {
-            role: 'user',
-            parts: [{
-              text: `
-                You are a TCM expert and nutritionist. 
-                Context: The user has been analyzed with the constitution type: ${analysis.constitutionType}.
-                Characteristics: ${analysis.characteristics.join(', ')}.
-                Recent pain logs: ${painRecords.slice(0, 5).map(r => `${r.location}(${r.intensity})`).join(', ')}.
-                
-                Please answer the user's question about their diet or wellness in ${lang === 'zh' ? 'Chinese' : 'English'}.
-                Be professional, warm, and helpful.
-                
-                Question: ${userMsg}
-              `
-            }]
-          }
-        ],
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+      const history = [
+        {
+          role: 'user',
+          parts: [{
+            text: `
+              You are a TCM expert and nutritionist. 
+              Context: The user has been analyzed with the constitution type: ${analysis.constitutionType}.
+              Characteristics: ${analysis.characteristics.join(', ')}.
+              Recent pain logs: ${painRecords.slice(0, 5).map(r => `${r.location}(${r.intensity})`).join(', ')}.
+              
+              Please answer the user's question about their diet or wellness in ${lang === 'zh' ? 'Chinese' : 'English'}.
+              Be professional, warm, and helpful.
+            `
+          }]
+        },
+        ...chatMessages.map(m => ({
+          role: m.role,
+          parts: [{ text: m.content }]
+        })),
+        {
+          role: 'user',
+          parts: [{ text: userMsg }]
         }
+      ];
+
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history })
       });
 
-      const response = await chat;
-      const modelMsg = response.text || t.chatProcessError;
-      setChatMessages([...newMessages, { role: 'model' as const, content: modelMsg }]);
+      if (!response.ok) throw new Error('Chat failed');
+      
+      const data = await response.json();
+      setChatMessages([...newMessages, { role: 'model' as const, content: data.text }]);
     } catch (error) {
       console.error("Chat failed:", error);
       setChatMessages([...newMessages, { role: 'model' as const, content: t.chatError }]);
@@ -394,6 +496,46 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#F5F2ED] text-[#1A1A1A] font-serif">
+      {/* Auth State Overlay */}
+      <AnimatePresence>
+        {isAuthLoading && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[200] flex items-center justify-center bg-[#F5F2ED]"
+          >
+            <Loader2 className="animate-spin text-[#5A5A40]" size={40} />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Login Screen */}
+      {!user && !isAuthLoading && (
+        <div className="fixed inset-0 z-[150] flex items-center justify-center bg-[#F5F2ED] p-4">
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-white p-8 rounded-[2rem] shadow-xl max-w-md w-full text-center space-y-6"
+          >
+            <div className="w-16 h-16 bg-[#5A5A40] rounded-full flex items-center justify-center text-white mx-auto">
+              <Leaf size={32} />
+            </div>
+            <div className="space-y-2">
+              <h1 className="text-2xl font-bold text-[#5A5A40]">{t.appName}</h1>
+              <p className="text-gray-500 text-sm">{t.pleaseLogin}</p>
+            </div>
+            <button 
+              onClick={signInWithGoogle}
+              className="w-full py-4 px-6 bg-white border-2 border-gray-100 rounded-2xl flex items-center justify-center gap-3 font-bold hover:bg-gray-50 transition-all active:scale-95 shadow-sm"
+            >
+              <img src="https://www.google.com/favicon.ico" alt="Google" className="w-5 h-5" />
+              {t.signInWithGoogle}
+            </button>
+          </motion.div>
+        </div>
+      )}
+
       {/* Header */}
       <header className="bg-white border-b border-[#1A1A1A]/10 sticky top-0 z-50">
         <div className="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
@@ -427,25 +569,51 @@ export default function App() {
               </button>
             </div>
           </div>
-          <button 
-            onClick={runAnalysis}
-            disabled={isAnalyzing || (painRecords.length === 0 && reports.length === 0)}
-            className={cn(
-              "px-4 py-1.5 rounded-full text-sm font-medium transition-all flex items-center gap-2 relative",
-              (isAnalyzing || (painRecords.length === 0 && reports.length === 0)) 
-                ? "bg-gray-100 text-gray-400 cursor-not-allowed" 
-                : "bg-[#5A5A40] text-white hover:bg-[#4A4A30] shadow-sm active:scale-95",
-              hasNewData && !isAnalyzing && "animate-pulse-subtle"
+          
+          <div className="flex items-center gap-2 sm:gap-4">
+            {user && (
+              <div className="hidden md:flex items-center gap-2 mr-2">
+                {user.photoURL ? (
+                  <img src={user.photoURL} alt="Avatar" className="w-6 h-6 rounded-full border border-gray-200" />
+                ) : (
+                  <div className="w-6 h-6 rounded-full bg-gray-100 flex items-center justify-center text-[10px]">
+                    {user.displayName?.charAt(0)}
+                  </div>
+                )}
+                <span className="text-[10px] font-bold text-gray-500 uppercase tracking-tighter">{t.welcome}</span>
+              </div>
             )}
-            title={painRecords.length === 0 && reports.length === 0 ? t.addRecordOrReport : ""}
-          >
-            {isAnalyzing ? <Loader2 className="animate-spin" size={16} /> : <Activity size={16} />}
-            {isAnalyzing ? t.analyzing : t.startAnalysis}
             
-            {hasNewData && !isAnalyzing && (
-              <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-white animate-pulse" />
+            <button 
+              onClick={runAnalysis}
+              disabled={isAnalyzing || (painRecords.length === 0 && reports.length === 0)}
+              className={cn(
+                "px-3 sm:px-4 py-1.5 rounded-full text-xs sm:text-sm font-medium transition-all flex items-center gap-2 relative",
+                (isAnalyzing || (painRecords.length === 0 && reports.length === 0)) 
+                  ? "bg-gray-100 text-gray-400 cursor-not-allowed" 
+                  : "bg-[#5A5A40] text-white hover:bg-[#4A4A30] shadow-sm active:scale-95",
+                hasNewData && !isAnalyzing && "animate-pulse-subtle"
+              )}
+              title={painRecords.length === 0 && reports.length === 0 ? t.addRecordOrReport : ""}
+            >
+              {isAnalyzing ? <Loader2 className="animate-spin" size={16} /> : <Activity size={16} />}
+              <span className="hidden sm:inline">{isAnalyzing ? t.analyzing : t.startAnalysis}</span>
+              
+              {hasNewData && !isAnalyzing && (
+                <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-white animate-pulse" />
+              )}
+            </button>
+
+            {user && (
+              <button 
+                onClick={logout}
+                className="p-2 hover:bg-gray-100 rounded-full text-gray-400 transition-colors"
+                title={t.logout}
+              >
+                <X size={20} />
+              </button>
             )}
-          </button>
+          </div>
         </div>
       </header>
 
@@ -608,7 +776,7 @@ export default function App() {
                     <div>
                       <label className="block text-xs font-bold text-gray-400 uppercase mb-2">{t.painLocation}</label>
                       <div className="grid grid-cols-3 gap-2">
-                        {t.locations.map(loc => (
+                        {t.locations.map((loc, idx) => (
                           <button
                             key={loc}
                             onClick={() => setNewPain({...newPain, location: loc})}
@@ -621,6 +789,22 @@ export default function App() {
                           </button>
                         ))}
                       </div>
+                      {(newPain.location === translations.zh.locations[translations.zh.locations.length - 1] || 
+                        newPain.location === translations.en.locations[translations.en.locations.length - 1]) && (
+                        <motion.div 
+                          initial={{ opacity: 0, y: -10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className="mt-2"
+                        >
+                          <input 
+                            type="text"
+                            value={customLocation}
+                            onChange={(e) => setCustomLocation(e.target.value)}
+                            placeholder={lang === 'zh' ? "请输入疼痛部位/类型" : "Enter pain location/type"}
+                            className="w-full p-3 bg-[#F5F2ED] rounded-xl border-none focus:ring-2 focus:ring-[#5A5A40] text-sm"
+                          />
+                        </motion.div>
+                      )}
                     </div>
                     <div>
                       <label className="block text-xs font-bold text-gray-400 uppercase mb-2">{t.intensity}</label>

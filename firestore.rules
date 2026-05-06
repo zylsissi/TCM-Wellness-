@@ -1,0 +1,92 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function isEmailVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    // --- User Profile ---
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['uid', 'email']) &&
+               data.uid == request.auth.uid &&
+               data.email is string && data.email.size() <= 100;
+      }
+
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && isValidUser(incoming()) && 
+                    incoming().diff(resource.data).affectedKeys().hasOnly(['displayName', 'lang']);
+    }
+
+    // --- Pain Records ---
+    match /users/{userId}/pain_records/{recordId} {
+      function isValidPainRecord(data) {
+        return data.keys().hasAll(['id', 'date', 'location', 'intensity', 'userId']) &&
+               data.id == recordId &&
+               data.userId == request.auth.uid &&
+               data.location is string && data.location.size() <= 100 &&
+               data.intensity in ['Low', 'Medium', 'High'] &&
+               data.date is string;
+      }
+
+      allow list, get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidPainRecord(incoming());
+      allow update: if isOwner(userId) && isValidPainRecord(incoming()) &&
+                    incoming().diff(resource.data).affectedKeys().hasOnly(['location', 'intensity', 'description', 'date']);
+      allow delete: if isOwner(userId);
+    }
+
+    // --- Medical Reports ---
+    match /users/{userId}/medical_reports/{reportId} {
+      function isValidReport(data) {
+        return data.keys().hasAll(['id', 'name', 'uploadDate', 'type', 'userId']) &&
+               data.id == reportId &&
+               data.userId == request.auth.uid &&
+               data.name is string && data.name.size() <= 200 &&
+               data.type in ['image', 'pdf', 'other'];
+      }
+
+      allow list, get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidReport(incoming());
+      allow delete: if isOwner(userId);
+    }
+
+    // --- Analysis ---
+    match /users/{userId}/analysis/latest {
+      function isValidAnalysis(data) {
+        return data.keys().hasAll(['constitutionType', 'characteristics', 'painAnalysis', 'dietaryAdvice', 'lifestyleAdvice', 'userId']) &&
+               data.userId == request.auth.uid &&
+               data.constitutionType is string &&
+               data.characteristics is list &&
+               data.dietaryAdvice is list &&
+               data.lifestyleAdvice is list;
+      }
+
+      allow get: if isOwner(userId);
+      allow write: if isOwner(userId) && isValidAnalysis(incoming());
+    }
+  }
+}

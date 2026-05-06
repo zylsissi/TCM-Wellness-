@@ -1,0 +1,78 @@
+{
+  "entities": {
+    "PainRecord": {
+      "title": "Pain Record",
+      "description": "A record of pain symptoms experienced by the user.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "date": { "type": "string", "format": "date-time" },
+        "location": { "type": "string" },
+        "intensity": { "type": "string", "enum": ["Low", "Medium", "High"] },
+        "description": { "type": "string" },
+        "userId": { "type": "string" }
+      },
+      "required": ["id", "date", "location", "intensity", "userId"]
+    },
+    "MedicalReport": {
+      "title": "Medical Report",
+      "description": "An uploaded medical report image or PDF.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "uploadDate": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["image", "pdf", "other"] },
+        "content": { "type": "string", "description": "Base64 content of the file" },
+        "userId": { "type": "string" }
+      },
+      "required": ["id", "name", "uploadDate", "type", "userId"]
+    },
+    "TCMAnalysis": {
+      "title": "TCM Analysis Result",
+      "description": "The AI-generated TCM constitution analysis and advice.",
+      "type": "object",
+      "properties": {
+        "constitutionType": { "type": "string" },
+        "characteristics": { "type": "array", "items": { "type": "string" } },
+        "painAnalysis": { "type": "string" },
+        "dietaryAdvice": { "type": "array", "items": { "type": "string" } },
+        "lifestyleAdvice": { "type": "array", "items": { "type": "string" } },
+        "herbalSuggestions": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "userId": { "type": "string" }
+      },
+      "required": ["constitutionType", "characteristics", "painAnalysis", "dietaryAdvice", "lifestyleAdvice", "userId"]
+    },
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "Basic user information and settings.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "lang": { "type": "string", "enum": ["zh", "en"] }
+      },
+      "required": ["uid", "email"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Main user document"
+    },
+    "/users/{userId}/pain_records/{recordId}": {
+      "schema": "PainRecord",
+      "description": "History of pain logs"
+    },
+    "/users/{userId}/medical_reports/{reportId}": {
+      "schema": "MedicalReport",
+      "description": "History of uploaded reports"
+    },
+    "/users/{userId}/analysis/latest": {
+      "schema": "TCMAnalysis",
+      "description": "Most recent AI analysis"
+    }
+  }
+}
