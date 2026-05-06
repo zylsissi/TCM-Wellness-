@@ -15,6 +15,7 @@ export interface PainRecord {
   location: string;
   intensity: PainIntensity;
   description: string;
+  userId?: string;
 }
 
 export interface MedicalReport {
@@ -25,6 +26,7 @@ export interface MedicalReport {
   content?: string; // Base64 data or data from chunks
   isChunked?: boolean;
   chunkCount?: number;
+  userId?: string;
 }
 
 export interface TCMAnalysis {

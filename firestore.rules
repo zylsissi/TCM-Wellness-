@@ -48,8 +48,7 @@ service cloud.firestore {
                data.id == recordId &&
                data.userId == request.auth.uid &&
                data.location is string && data.location.size() <= 100 &&
-               data.intensity in ['Low', 'Medium', 'High'] &&
-               data.date is string;
+               data.intensity in ['Low', 'Medium', 'High'];
       }
 
       allow list, get: if isOwner(userId);

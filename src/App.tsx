@@ -70,38 +70,49 @@ export default function App() {
   const [selectedReport, setSelectedReport] = useState<MedicalReport | null>(null);
   const [reportFullContent, setReportFullContent] = useState<string>('');
   const [isAssembling, setIsAssembling] = useState(false);
+  const [assemblyError, setAssemblyError] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [hasNewData, setHasNewData] = useState(false);
+  const [lang, setLang] = useState<'zh' | 'en'>('zh');
 
   // Reassemble chunked reports
   useEffect(() => {
     if (!selectedReport || !user) {
       setReportFullContent('');
+      setAssemblyError(null);
       return;
     }
 
     if (!selectedReport.isChunked) {
       setReportFullContent(selectedReport.content || '');
+      setAssemblyError(null);
       return;
     }
 
     const assemble = async () => {
       setIsAssembling(true);
+      setAssemblyError(null);
       try {
         const chunksRef = collection(db, 'users', user.uid, 'medical_reports', selectedReport.id, 'chunks');
         const q = query(chunksRef, orderBy('idx', 'asc'));
         const snap = await getDocs(q);
+        
+        if (snap.empty) {
+          throw new Error("No data found for this report.");
+        }
+        
         const data = snap.docs.map(doc => doc.data().data).join('');
         setReportFullContent(data);
-      } catch (err) {
+      } catch (err: any) {
         console.error("Assembly failed:", err);
+        setAssemblyError(lang === 'zh' ? `无法加载报告内容: ${err.message}` : `Failed to load report: ${err.message}`);
       } finally {
         setIsAssembling(false);
       }
     };
 
     assemble();
-  }, [selectedReport, user]);
-  const [hasNewData, setHasNewData] = useState(false);
-  const [lang, setLang] = useState<'zh' | 'en'>('zh');
+  }, [selectedReport, user, lang]);
   const [chatMessages, setChatMessages] = useState<{role: 'user' | 'model', content: string}[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
@@ -248,56 +259,70 @@ export default function App() {
       return;
     }
 
+    setIsUploading(true);
     const reader = new FileReader();
     reader.onload = async (event) => {
-      const base64Data = event.target?.result as string;
-      
-      let fileType: 'image' | 'pdf' | 'other' = 'other';
-      if (file.type.includes('image')) fileType = 'image';
-      else if (file.type.includes('pdf')) fileType = 'pdf';
-
-      const reportId = Date.now().toString();
-      
-      // Firestore document limit is 1MB. Base64 is ~1.37x raw size.
-      // We'll chunk the final base64 string into 800KB pieces.
-      const CHUNK_SIZE = 800 * 1024;
-      const isChunked = base64Data.length > CHUNK_SIZE;
-
-      const newReport: MedicalReport = {
-        id: reportId,
-        name: file.name,
-        uploadDate: new Date().toISOString(),
-        type: fileType,
-        content: isChunked ? "" : base64Data, // Only store raw if not chunked
-        isChunked,
-        chunkCount: isChunked ? Math.ceil(base64Data.length / CHUNK_SIZE) : 1
-      };
-      
       try {
-        await setDoc(doc(db, 'users', user.uid, 'medical_reports', reportId), {
-          ...newReport,
-          userId: user.uid
-        });
+        const base64Data = event.target?.result as string;
+        if (!base64Data) throw new Error("File reading failed");
+        
+        let fileType: 'image' | 'pdf' | 'other' = 'other';
+        if (file.type.includes('image')) fileType = 'image';
+        else if (file.type.includes('pdf')) fileType = 'pdf';
 
+        const reportId = Date.now().toString();
+        
+        // Use smaller chunk size for more reliability (500KB)
+        const CHUNK_SIZE = 500 * 1024;
+        const isChunked = base64Data.length > CHUNK_SIZE;
+
+        const newReport: MedicalReport = {
+          id: reportId,
+          name: file.name,
+          uploadDate: new Date().toISOString(),
+          type: fileType,
+          content: isChunked ? "" : base64Data,
+          isChunked,
+          chunkCount: isChunked ? Math.ceil(base64Data.length / CHUNK_SIZE) : 1,
+          userId: user.uid
+        };
+        
+        // Save main record
+        await setDoc(doc(db, 'users', user.uid, 'medical_reports', reportId), newReport);
+
+        // Save chunks if needed
         if (isChunked) {
           const chunksRef = collection(db, 'users', user.uid, 'medical_reports', reportId, 'chunks');
+          const chunkPromises = [];
+          
           for (let i = 0; i < newReport.chunkCount!; i++) {
             const start = i * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, base64Data.length);
             const chunkData = base64Data.substring(start, end);
             
-            await setDoc(doc(chunksRef, i.toString()), {
+            chunkPromises.push(setDoc(doc(chunksRef, i.toString()), {
               idx: i,
               data: chunkData
-            });
+            }));
           }
+          
+          await Promise.all(chunkPromises);
         }
 
         alert(t.uploadSuccess);
-      } catch (error) {
-        alert(t.uploadFailed);
-        handleFirestoreError(error, OperationType.WRITE, `users/${user.uid}/medical_reports`);
+      } catch (error: any) {
+        console.error("Upload failed:", error);
+        alert(`${t.uploadFailed}: ${error.message || "Unknown error"}`);
+        if (error.code !== undefined) {
+          handleFirestoreError(error, OperationType.WRITE, `users/${user.uid}/medical_reports`);
+        }
+      } finally {
+        setIsUploading(false);
       }
+    };
+    reader.onerror = () => {
+      alert(t.uploadFailed);
+      setIsUploading(false);
     };
     reader.readAsDataURL(file);
     e.target.value = '';
@@ -971,12 +996,18 @@ export default function App() {
               exit={{ opacity: 0, x: -20 }}
               className="space-y-6"
             >
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between mb-8">
                 <h2 className="text-2xl font-bold">{t.reports}</h2>
-                <label className="bg-[#5A5A40] text-white p-2 rounded-full hover:bg-[#4A4A30] transition-colors cursor-pointer">
-                  <Upload size={20} />
-                  <input type="file" className="hidden" onChange={handleFileUpload} accept="image/*,.pdf" />
-                </label>
+                <div className="flex items-center gap-3">
+                  {isUploading && <Loader2 className="animate-spin text-[#5A5A40]" size={20} />}
+                  <label className={cn(
+                    "bg-[#5A5A40] text-white p-2 rounded-full hover:bg-[#4A4A30] transition-colors cursor-pointer",
+                    isUploading && "opacity-50 cursor-not-allowed pointer-events-none"
+                  )}>
+                    <Upload size={20} />
+                    <input type="file" className="hidden" onChange={handleFileUpload} accept="image/*,.pdf" disabled={isUploading} />
+                  </label>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -999,11 +1030,23 @@ export default function App() {
                   </div>
                 ))}
                 
-                <label className="border-2 border-dashed border-gray-200 rounded-3xl p-8 flex flex-col items-center justify-center text-center cursor-pointer hover:border-[#5A5A40] transition-colors bg-white/50">
-                  <Upload size={32} className="text-gray-300 mb-4" />
-                  <p className="text-sm font-bold text-gray-400">{t.clickToUpload}</p>
-                  <p className="text-xs text-gray-300 mt-1">{t.supportFormat}</p>
-                  <input type="file" className="hidden" onChange={handleFileUpload} accept="image/*,.pdf" />
+                <label className={cn(
+                  "border-2 border-dashed border-gray-200 rounded-3xl p-8 flex flex-col items-center justify-center text-center cursor-pointer hover:border-[#5A5A40] transition-colors bg-white/50",
+                  isUploading && "opacity-50 cursor-not-allowed pointer-events-none"
+                )}>
+                  {isUploading ? (
+                    <div className="flex flex-col items-center">
+                      <Loader2 size={32} className="text-[#5A5A40] animate-spin mb-4" />
+                      <p className="text-sm font-bold text-[#5A5A40]">{t.syncing}</p>
+                    </div>
+                  ) : (
+                    <>
+                      <Upload size={32} className="text-gray-300 mb-4" />
+                      <p className="text-sm font-bold text-gray-400">{t.clickToUpload}</p>
+                      <p className="text-xs text-gray-300 mt-1">{t.supportFormat}</p>
+                    </>
+                  )}
+                  <input type="file" className="hidden" onChange={handleFileUpload} accept="image/*,.pdf" disabled={isUploading} />
                 </label>
               </div>
 
@@ -1261,6 +1304,11 @@ export default function App() {
                   <div className="flex flex-col items-center gap-3">
                     <Loader2 className="animate-spin text-[#5A5A40]" size={40} />
                     <p className="text-sm text-gray-500">{t.syncing}</p>
+                  </div>
+                ) : assemblyError ? (
+                  <div className="text-center p-12 text-red-500">
+                    <AlertCircle size={48} className="mx-auto mb-4" />
+                    <p className="font-medium">{assemblyError}</p>
                   </div>
                 ) : (
                   <>
