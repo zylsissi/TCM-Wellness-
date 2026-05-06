@@ -22,7 +22,9 @@ export interface MedicalReport {
   name: string;
   uploadDate: string;
   type: 'image' | 'pdf' | 'other';
-  content?: string; // Base64 data or extracted text
+  content?: string; // Base64 data or data from chunks
+  isChunked?: boolean;
+  chunkCount?: number;
 }
 
 export interface TCMAnalysis {

@@ -72,6 +72,10 @@ service cloud.firestore {
       allow list, get: if isOwner(userId);
       allow create: if isOwner(userId) && isValidReport(incoming());
       allow delete: if isOwner(userId);
+
+      match /chunks/{chunkIdx} {
+        allow read, write: if isOwner(userId);
+      }
     }
 
     // --- Analysis ---

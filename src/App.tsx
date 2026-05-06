@@ -52,6 +52,7 @@ import {
   doc, 
   setDoc,
   getDoc,
+  getDocs,
   orderBy,
   Timestamp,
   serverTimestamp
@@ -67,6 +68,38 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'records' | 'reports' | 'analysis'>('dashboard');
   const [showPainForm, setShowPainForm] = useState(false);
   const [selectedReport, setSelectedReport] = useState<MedicalReport | null>(null);
+  const [reportFullContent, setReportFullContent] = useState<string>('');
+  const [isAssembling, setIsAssembling] = useState(false);
+
+  // Reassemble chunked reports
+  useEffect(() => {
+    if (!selectedReport || !user) {
+      setReportFullContent('');
+      return;
+    }
+
+    if (!selectedReport.isChunked) {
+      setReportFullContent(selectedReport.content || '');
+      return;
+    }
+
+    const assemble = async () => {
+      setIsAssembling(true);
+      try {
+        const chunksRef = collection(db, 'users', user.uid, 'medical_reports', selectedReport.id, 'chunks');
+        const q = query(chunksRef, orderBy('idx', 'asc'));
+        const snap = await getDocs(q);
+        const data = snap.docs.map(doc => doc.data().data).join('');
+        setReportFullContent(data);
+      } catch (err) {
+        console.error("Assembly failed:", err);
+      } finally {
+        setIsAssembling(false);
+      }
+    };
+
+    assemble();
+  }, [selectedReport, user]);
   const [hasNewData, setHasNewData] = useState(false);
   const [lang, setLang] = useState<'zh' | 'en'>('zh');
   const [chatMessages, setChatMessages] = useState<{role: 'user' | 'model', content: string}[]>([]);
@@ -209,8 +242,8 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Limit to 1MB to stay within Firestore's 1MB document limit
-    if (file.size > 1024 * 1024) {
+    // Up to 3MB limit
+    if (file.size > 3 * 1024 * 1024) {
       alert(t.fileTooLarge);
       return;
     }
@@ -224,12 +257,20 @@ export default function App() {
       else if (file.type.includes('pdf')) fileType = 'pdf';
 
       const reportId = Date.now().toString();
+      
+      // Firestore document limit is 1MB. Base64 is ~1.37x raw size.
+      // We'll chunk the final base64 string into 800KB pieces.
+      const CHUNK_SIZE = 800 * 1024;
+      const isChunked = base64Data.length > CHUNK_SIZE;
+
       const newReport: MedicalReport = {
         id: reportId,
         name: file.name,
         uploadDate: new Date().toISOString(),
         type: fileType,
-        content: base64Data
+        content: isChunked ? "" : base64Data, // Only store raw if not chunked
+        isChunked,
+        chunkCount: isChunked ? Math.ceil(base64Data.length / CHUNK_SIZE) : 1
       };
       
       try {
@@ -237,6 +278,21 @@ export default function App() {
           ...newReport,
           userId: user.uid
         });
+
+        if (isChunked) {
+          const chunksRef = collection(db, 'users', user.uid, 'medical_reports', reportId, 'chunks');
+          for (let i = 0; i < newReport.chunkCount!; i++) {
+            const start = i * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, base64Data.length);
+            const chunkData = base64Data.substring(start, end);
+            
+            await setDoc(doc(chunksRef, i.toString()), {
+              idx: i,
+              data: chunkData
+            });
+          }
+        }
+
         alert(t.uploadSuccess);
       } catch (error) {
         alert(t.uploadFailed);
@@ -288,12 +344,22 @@ export default function App() {
         }
       `;
 
+      const rawReports = reports.slice(0, 3);
+      const reportsWithContent = await Promise.all(rawReports.map(async (r) => {
+        if (!r.isChunked) return { content: r.content };
+        
+        const chunksRef = collection(db, 'users', user.uid, 'medical_reports', r.id, 'chunks');
+        const q = query(chunksRef, orderBy('idx', 'asc'));
+        const snap = await getDocs(q);
+        return { content: snap.docs.map(d => d.data().data).join('') };
+      }));
+
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt,
-          reports: reports.slice(0, 3).map(r => ({ content: r.content })),
+          reports: reportsWithContent,
           lang
         })
       });
@@ -1190,39 +1256,48 @@ export default function App() {
                   <X size={20} />
                 </button>
               </div>
-              <div className="flex-1 overflow-auto p-6 bg-gray-50 flex items-center justify-center relative">
-                {selectedReport.type === 'image' ? (
-                  <img 
-                    src={selectedReport.content} 
-                    alt={selectedReport.name} 
-                    className="max-w-full h-auto rounded-lg shadow-sm"
-                    referrerPolicy="no-referrer"
-                  />
-                ) : selectedReport.type === 'pdf' ? (
-                  <div className="w-full h-full flex flex-col items-center">
-                    <object
-                      data={selectedReport.content}
-                      type="application/pdf"
-                      className="w-full h-full min-h-[60vh] rounded-lg shadow-sm"
-                    >
-                      <div className="text-center p-12 bg-white rounded-2xl border border-gray-200">
-                        <FileText size={48} className="mx-auto text-gray-300 mb-4" />
-                        <p className="text-gray-600 mb-4">{t.browserNoPdf}</p>
-                        <a 
-                          href={selectedReport.content} 
-                          download={selectedReport.name}
-                          className="inline-flex items-center gap-2 px-6 py-2 bg-[#5A5A40] text-white rounded-full text-sm font-bold"
-                        >
-                          {t.downloadToView}
-                        </a>
-                      </div>
-                    </object>
+              <div className="flex-1 overflow-auto p-6 bg-gray-50 flex items-center justify-center relative min-h-[300px]">
+                {isAssembling ? (
+                  <div className="flex flex-col items-center gap-3">
+                    <Loader2 className="animate-spin text-[#5A5A40]" size={40} />
+                    <p className="text-sm text-gray-500">{t.syncing}</p>
                   </div>
                 ) : (
-                  <div className="text-center p-12">
-                    <FileText size={48} className="mx-auto text-gray-300 mb-4" />
-                    <p className="text-gray-500">{t.unsupportedPreview}</p>
-                  </div>
+                  <>
+                    {selectedReport.type === 'image' ? (
+                      <img 
+                        src={reportFullContent} 
+                        alt={selectedReport.name} 
+                        className="max-w-full h-auto rounded-lg shadow-sm"
+                        referrerPolicy="no-referrer"
+                      />
+                    ) : selectedReport.type === 'pdf' ? (
+                      <div className="w-full h-full flex flex-col items-center">
+                        <object
+                          data={reportFullContent}
+                          type="application/pdf"
+                          className="w-full h-full min-h-[60vh] rounded-lg shadow-sm"
+                        >
+                          <div className="text-center p-12 bg-white rounded-2xl border border-gray-200">
+                            <FileText size={48} className="mx-auto text-gray-300 mb-4" />
+                            <p className="text-gray-600 mb-4">{t.browserNoPdf}</p>
+                            <a 
+                              href={reportFullContent} 
+                              download={selectedReport.name}
+                              className="inline-flex items-center gap-2 px-6 py-2 bg-[#5A5A40] text-white rounded-full text-sm font-bold"
+                            >
+                              {t.downloadToView}
+                            </a>
+                          </div>
+                        </object>
+                      </div>
+                    ) : (
+                      <div className="text-center p-12">
+                        <FileText size={48} className="mx-auto text-gray-300 mb-4" />
+                        <p className="text-gray-500">{t.unsupportedPreview}</p>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             </motion.div>

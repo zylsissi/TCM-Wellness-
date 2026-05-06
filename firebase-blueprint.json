@@ -23,7 +23,9 @@
         "name": { "type": "string" },
         "uploadDate": { "type": "string", "format": "date-time" },
         "type": { "type": "string", "enum": ["image", "pdf", "other"] },
-        "content": { "type": "string", "description": "Base64 content of the file" },
+        "content": { "type": "string", "description": "Base64 content of the file (if < 1MB)" },
+        "isChunked": { "type": "boolean" },
+        "chunkCount": { "type": "number" },
         "userId": { "type": "string" }
       },
       "required": ["id", "name", "uploadDate", "type", "userId"]
@@ -73,6 +75,10 @@
     "/users/{userId}/analysis/latest": {
       "schema": "TCMAnalysis",
       "description": "Most recent AI analysis"
+    },
+    "/users/{userId}/medical_reports/{reportId}/chunks/{chunkIdx}": {
+      "schema": "object",
+      "description": "Portions of a large file"
     }
   }
 }
