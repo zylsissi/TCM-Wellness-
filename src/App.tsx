@@ -209,7 +209,8 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (file.size > 2 * 1024 * 1024) {
+    // Limit to 1MB to stay within Firestore's 1MB document limit
+    if (file.size > 1024 * 1024) {
       alert(t.fileTooLarge);
       return;
     }
@@ -236,7 +237,9 @@ export default function App() {
           ...newReport,
           userId: user.uid
         });
+        alert(t.uploadSuccess);
       } catch (error) {
+        alert(t.uploadFailed);
         handleFirestoreError(error, OperationType.WRITE, `users/${user.uid}/medical_reports`);
       }
     };
